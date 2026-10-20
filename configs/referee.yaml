@@ -1,0 +1,9 @@
+# Referee-only detector.
+path: ../data/referee_detection
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: referee

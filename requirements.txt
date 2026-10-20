@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+numpy
+pandas
+tqdm
+matplotlib
+lap>=0.5.12

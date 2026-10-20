@@ -1,0 +1,15 @@
+# YOLO detection dataset. `path` is relative to this file.
+# Classes stay at four until the detector is reliable.
+# Team identity is a later step, not a detection class.
+
+path: ../data/soccer_detection
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: player
+  1: goalkeeper
+  2: referee
+  3: ball

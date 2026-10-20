@@ -1,0 +1,9 @@
+# Ball-only detector. Images without LabelMe JSON are excluded.
+path: E:/Football_dataset/ball_detection
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: ball

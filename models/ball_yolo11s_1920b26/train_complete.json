@@ -1,0 +1,4 @@
+{
+  "best": "/home/soccer_event_ai/ball_vps_train/runs/train/ball_yolo11s_1920b26/weights/best.pt",
+  "last": "/home/soccer_event_ai/ball_vps_train/runs/train/ball_yolo11s_1920b26/weights/last.pt"
+}

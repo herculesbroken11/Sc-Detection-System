@@ -1,0 +1,9 @@
+# Manual ball labels from labeling_finished.
+path: E:/Football_dataset/ball_labeled
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: ball

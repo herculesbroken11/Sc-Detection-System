@@ -878,7 +878,9 @@ def _row_score(row, name: str) -> float | None:
 
 def _team_suffix(row) -> str:
     team = _row_team(row)
-    return "" if team is None else f" T{team}"
+    if team is None:
+        return ""
+    return " Team A" if team == 0 else " Team B"
 
 
 def render_possession(tracks_path: Path, possession_path: Path, video_path: Path, destination: Path) -> None:

@@ -1,7 +1,7 @@
 """Save one sheet per track: every frame's box and the jersey crop window.
 
 Left cell is the full track box. Yellow is the box edge. Green is the window
-used by jersey_feature (30-70% of the height, 25% inset on each side).
+used by jersey_feature (25-70% of the height, 20% inset on each side).
 Right cell is the pixels inside that window.
 """
 

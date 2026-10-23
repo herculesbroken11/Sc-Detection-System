@@ -22,6 +22,10 @@ from ultralytics.trackers.byte_tracker import BYTETracker
 
 from common import CLASS_NAMES, SOCCER_WEIGHTS
 from team_byte import (
+    JERSEY_X_INSET,
+    JERSEY_Y0,
+    JERSEY_Y1,
+    SHIRT_OVERLAP_IOU,
     LABEL_REFEREE,
     LABEL_UNKNOWN,
     TEAM_SWITCH_CONF,
@@ -60,10 +64,10 @@ def jersey_band(image, box):
     x1, y1, x2, y2 = [float(v) for v in box]
     box_h = y2 - y1
     box_w = x2 - x1
-    top = max(0, int(round(y1 + 0.30 * box_h)))
-    bottom = min(height, int(round(y1 + 0.70 * box_h)))
-    left = max(0, int(round(x1 + 0.25 * box_w)))
-    right = min(width, int(round(x2 - 0.25 * box_w)))
+    top = max(0, int(round(y1 + JERSEY_Y0 * box_h)))
+    bottom = min(height, int(round(y1 + JERSEY_Y1 * box_h)))
+    left = max(0, int(round(x1 + JERSEY_X_INSET * box_w)))
+    right = min(width, int(round(x2 - JERSEY_X_INSET * box_w)))
     if bottom <= top or right <= left:
         return None
     return image[top:bottom, left:right].copy()
@@ -529,7 +533,7 @@ def main() -> None:
                     if other_index == index or int(classes[other_index]) not in {0, 1, 2}:
                         continue
                     other = tuple(float(v) for v in other_values[:4])
-                    if iou(own, other) >= 0.15:
+                    if iou(own, other) >= SHIRT_OVERLAP_IOU:
                         overlapped = True
                         break
                 reason = label_reason(class_id, overlapped, feature, team)

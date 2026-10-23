@@ -34,21 +34,10 @@ RELEASE_HX = 0.55
 RELEASE_HY = 0.85
 FOOT_HALF_WIDTH = 0.22
 FOOT_Y_MARGIN = 0.15
-LOOK_RETAIN = 12
 LOOK_RECEIVE = 10
-LOOK_RELEASE = 8
 CANDIDATES = 3
-# Net pixels per frame over LOOK_RELEASE. Single-frame speed is mostly jitter.
+# Pixels per frame. A single frame of motion is mostly jitter.
 FLIGHT_SPEED = 10.0
-# Alignment of the incoming path with the outgoing path. Below this, the ball turned.
-TRAJECTORY_TURN = 0.35
-TRAJECTORY_STRAIGHT = 0.75
-# A bounce stays in one spot: the path is long, the net movement is not.
-MILL_NET_PX = 48.0
-MILL_PATH_RATIO = 2.2
-# A slow roll that does not change direction. Pixels per frame.
-GLIDE_ALIGN = 0.85
-GLIDE_SPEED = 10.0
 POSSESSION_COLUMNS = [
     "frame",
     "ball_track_id",
@@ -77,7 +66,6 @@ SEGMENT_COLUMNS = [
     "release_player_id",
 ]
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Estimate ball control from tracked players. Nearest player is evidence only.")
     parser.add_argument(
@@ -105,10 +93,8 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 def _hypot(dx: float, dy: float) -> float:
     return (dx * dx + dy * dy) ** 0.5
-
 
 def _span_velocity(samples: list[tuple[int, float, float]], frame: int, half: int) -> tuple[float, float]:
     """Velocity from the samples nearest to frame-half and frame+half."""
@@ -126,7 +112,6 @@ def _span_velocity(samples: list[tuple[int, float, float]], frame: int, half: in
     step = max(1, frame_1 - frame_0)
     return (x1 - x0) / step, (y1 - y0) / step
 
-
 def _nearest_sample(samples: list[tuple[int, float, float]], frame: int) -> tuple[int, float, float] | None:
     if not samples:
         return None
@@ -138,7 +123,6 @@ def _nearest_sample(samples: list[tuple[int, float, float]], frame: int) -> tupl
     if index > 0:
         choices.append(samples[index - 1])
     return min(choices, key=lambda sample: abs(sample[0] - frame))
-
 
 class _Person:
     __slots__ = ("track_id", "role", "x1", "y1", "x2", "y2", "foot_x", "foot_y", "height", "dx", "dy", "dist", "ell_acq", "ell_rel")
@@ -165,7 +149,6 @@ class _Person:
         self.dist = _hypot(dx, dy)
         self.ell_acq = (dx / ACQUIRE_HX) ** 2 + (dy / ACQUIRE_HY) ** 2
         self.ell_rel = (dx / RELEASE_HX) ** 2 + (dy / RELEASE_HY) ** 2
-
 
 class _Clip:
     """Offline possession for one clip. Decisions may look ahead."""
@@ -249,9 +232,6 @@ class _Clip:
             return 0.0
         step = max(1, self.frames[end] - self.frames[start])
         return _hypot(self.ball_x[end] - self.ball_x[start], self.ball_y[end] - self.ball_y[start]) / step
-
-    def player_velocity(self, track_id: int, frame: int, half: int = 4) -> tuple[float, float]:
-        return _span_velocity(self.feet.get(track_id, []), frame, half)
 
     def net_player_speed(self, track_id: int, frame_0: int, frame_1: int) -> float:
         samples = self.feet.get(track_id, [])
@@ -339,259 +319,6 @@ class _Clip:
 
     def _displacement(self, start: int, end: int) -> tuple[float, float]:
         return self.ball_x[end] - self.ball_x[start], self.ball_y[end] - self.ball_y[start]
-
-    def _turn_alignment(self, index: int) -> float | None:
-        """How aligned the departure is with the approach. None when there is no clear incoming path.
-
-        The approach and the departure are measured on opposite sides of this frame,
-        so a one-frame touch is not averaged away. A wiggly approach does not count.
-        """
-        if index < 4 or index + 3 >= len(self.frames):
-            return None
-        approach = self._displacement(index - 3, index)
-        earlier = self._displacement(index - 4, index - 1)
-        depart = self._displacement(index, index + 3)
-        approach_norm = _hypot(*approach)
-        earlier_norm = _hypot(*earlier)
-        depart_norm = _hypot(*depart)
-        if approach_norm < 18.0 or earlier_norm < 12.0 or depart_norm < 12.0:
-            return None
-        if approach_norm > 160.0 or depart_norm > 160.0:
-            return None
-        straight = (approach[0] * earlier[0] + approach[1] * earlier[1]) / (approach_norm * earlier_norm)
-        if straight < TRAJECTORY_STRAIGHT:
-            return None
-        return (approach[0] * depart[0] + approach[1] * depart[1]) / (approach_norm * depart_norm)
-
-    def ball_milling(self, index: int, radius: int = 8) -> bool:
-        """The ball is bouncing or dithering in one place, not traveling to a new player."""
-        start = max(0, index - radius)
-        end = min(len(self.frames) - 1, index + radius)
-        if end - start < 4:
-            return False
-        net = _hypot(self.ball_x[end] - self.ball_x[start], self.ball_y[end] - self.ball_y[start])
-        path = 0.0
-        for cursor in range(start + 1, end + 1):
-            path += _hypot(self.ball_x[cursor] - self.ball_x[cursor - 1], self.ball_y[cursor] - self.ball_y[cursor - 1])
-        if path < 30.0 or net > MILL_NET_PX:
-            return False
-        return path >= MILL_PATH_RATIO * max(net, 1.0)
-
-    def straight_glide(self, index: int) -> bool:
-        """The ball is moving slowly and keeping its direction."""
-        if index < 3 or index + 3 >= len(self.frames):
-            return False
-        if self.ball_milling(index):
-            return False
-        end = min(len(self.frames) - 1, index + 6)
-        if self.net_ball_speed(index, end) >= GLIDE_SPEED:
-            return False
-        approach = self._displacement(index - 3, index)
-        depart = self._displacement(index, index + 3)
-        approach_norm = _hypot(*approach)
-        depart_norm = _hypot(*depart)
-        if approach_norm < 6.0 or depart_norm < 6.0:
-            return False
-        aligned = (approach[0] * depart[0] + approach[1] * depart[1]) / (approach_norm * depart_norm)
-        return aligned >= GLIDE_ALIGN
-
-    def _same_owner_motion(self, track_id: int, index: int) -> bool:
-        """Keep the current owner through a local bounce or a slow straight roll."""
-        if self.straight_glide(index):
-            return True
-        if not self.ball_milling(index):
-            return False
-        person = self.person(index, track_id)
-        # A missing box is a blink, not a new owner, while the ball stays put.
-        return person is None or person.dist < 1.25
-
-    def immediate_actor(self, index: int) -> tuple[int, float] | None:
-        """Player who redirects an incoming ball on this frame, even if they do not keep it."""
-        if self.ball_milling(index) or self.straight_glide(index):
-            return None
-        turn = self._turn_alignment(index)
-        if turn is None or turn > TRAJECTORY_TURN:
-            return None
-        people = self.by_frame.get(self.frames[index], [])
-        if not people:
-            return None
-        person = people[0]
-        at_feet = person.ell_acq < 1.0
-        hard_deflection = person.ell_rel < 1.0 and turn < 0.0
-        if not at_feet and not hard_deflection:
-            return None
-        if len(people) > 1 and people[1].ell_acq < 1.0 and people[1].dist < person.dist + 0.12:
-            return None
-        # One frame only: the frame in this bend where that player is closest.
-        for cursor in (index - 1, index + 1):
-            other_turn = self._turn_alignment(cursor)
-            if other_turn is None or other_turn > TRAJECTORY_TURN:
-                continue
-            others = self.by_frame.get(self.frames[cursor], [])
-            if not others or others[0].track_id != person.track_id:
-                continue
-            if others[0].dist < person.dist - 0.02:
-                return None
-            if abs(others[0].dist - person.dist) <= 0.02 and other_turn < turn:
-                return None
-        return person.track_id, turn
-
-    def control_run(self, track_id: int, index: int, limit: int = 12) -> int:
-        """How long the ball stays in this player's release zone.
-
-        Two frames outside the zone still count. A second touch can move the
-        ball a long way for a frame or two without ending the run.
-        """
-        misses = 0
-        counted = 0
-        end = min(len(self.frames), index + limit)
-        for cursor in range(index, end):
-            person = self.person(cursor, track_id)
-            if person is not None and person.ell_rel < 1.0:
-                counted += 1
-                misses = 0
-            else:
-                misses += 1
-                if misses > 2:
-                    break
-        return counted
-
-    def _back_inside(self, track_id: int, index: int, frames: int = 2) -> bool:
-        """True when this player has the ball again within the next one or two frames."""
-        end = min(len(self.frames), index + frames + 1)
-        for cursor in range(index + 1, end):
-            person = self.person(cursor, track_id)
-            if person is not None and person.ell_rel < 1.0:
-                return True
-        return False
-
-    def _rival_taken(self, owner: int, index: int, owner_acquire: float) -> bool:
-        """Another player, not a brief overlap, is the one the ball stays with."""
-        for person in self.candidates(index, limit=4):
-            if person.track_id == owner or person.ell_acq >= 1.0:
-                continue
-            rival_acquire = self.close_fraction(person.track_id, index, LOOK_RECEIVE, acquire=True)
-            if rival_acquire < 0.55 or rival_acquire < owner_acquire + 0.35:
-                continue
-            if self.control_run(person.track_id, index) >= 8:
-                return True
-        return False
-
-    def retains(self, track_id: int, index: int, hold_contact: bool = True) -> bool:
-        """Keep the owner through a dribble, including touches that change direction.
-
-        hold_contact is off for the frame after a one-frame redirection. That
-        touch stays one frame unless the same player then keeps the ball.
-        """
-        person = self.person(index, track_id)
-        inside = person is not None and person.ell_rel < 1.0
-        if len(self.frames) - index < 4:
-            return inside and hold_contact
-        # A bounce in one spot, or a slow roll that does not change direction,
-        # does not move possession to a player the ball merely passes.
-        if hold_contact and self._same_owner_motion(track_id, index):
-            return True
-        future = self.close_fraction(track_id, index, LOOK_RETAIN, acquire=False)
-        acquire_fraction = self.close_fraction(track_id, index, LOOK_RETAIN, acquire=True)
-        aligned = self.alignment(track_id, index, LOOK_RETAIN)
-        if self._rival_taken(track_id, index, acquire_fraction):
-            return False
-        # The ball is still at this player's feet. A second touch can move it
-        # a long way in one or two frames; that strike is not a new possession.
-        if hold_contact and inside:
-            return True
-        if hold_contact and self._back_inside(track_id, index, frames=2):
-            return True
-        if future >= 0.45 and aligned >= 0.35:
-            return True
-        return self.control_run(track_id, index) >= 6 and aligned >= 0.45
-
-    def returns_soon(self, track_id: int, index: int) -> bool:
-        """The same player has the ball again within a few frames. A dribble touch, not a pass."""
-        end = min(len(self.frames), index + 6)
-        for cursor in range(index, end):
-            person = self.person(cursor, track_id)
-            if person is not None and person.ell_rel < 1.0 and self.control_run(track_id, cursor) >= 8:
-                return True
-        return False
-
-    def launches(self, track_id: int, index: int) -> bool:
-        """The ball leaves the owner faster than that player and does not come back."""
-        end = min(len(self.frames) - 1, index + LOOK_RELEASE)
-        if end <= index + 2:
-            return False
-        if self.close_fraction(track_id, index, LOOK_RELEASE, acquire=False) >= 0.35:
-            return False
-        start_person = self.person(index, track_id)
-        end_person = self.person(end, track_id)
-        start_dist = 0.0 if start_person is None else start_person.dist
-        end_dist = start_dist + 0.4 if end_person is None else end_person.dist
-        ball_speed = self.net_ball_speed(index, end)
-        player_speed = self.net_player_speed(track_id, self.frames[index], self.frames[end])
-        away = end_dist > start_dist + 0.20
-        fast = ball_speed > max(FLIGHT_SPEED, 1.5 * player_speed + 4.0)
-        return away and fast
-
-    def becomes_flight(self, index: int) -> bool:
-        end = min(len(self.frames) - 1, index + LOOK_RELEASE)
-        if end <= index + 2 or self.net_ball_speed(index, end) < FLIGHT_SPEED:
-            return False
-        for person in self.candidates(index, limit=4):
-            if self.close_fraction(person.track_id, index, LOOK_RELEASE, acquire=False) >= 0.45:
-                return False
-        return True
-
-    def landed(self, index: int) -> bool:
-        end = min(len(self.frames) - 1, index + 6)
-        if end <= index:
-            return False
-        return self.net_ball_speed(index, end) < 5.5
-
-    def best_receiver(self, index: int, state: str, release_id: int | None) -> int | None:
-        """Accept a new owner only after the ball stays with that player.
-
-        Proximity during a pass is not enough. From IN_FLIGHT the ball also
-        has to slow, turn, or start moving with the receiver.
-        """
-        if len(self.frames) - index < 6:
-            return None
-        if self.straight_glide(index) or self.ball_milling(index):
-            return None
-        best_id: int | None = None
-        best_key: tuple[float, int, float] | None = None
-        for person in self.candidates(index, limit=4):
-            if person.ell_rel >= 1.0:
-                continue
-            run = self.control_run(person.track_id, index)
-            if run < 10:
-                continue
-            release_fraction = self.close_fraction(person.track_id, index, LOOK_RECEIVE, acquire=False)
-            acquire_fraction = self.close_fraction(person.track_id, index, LOOK_RECEIVE, acquire=True)
-            aligned = self.alignment(person.track_id, index, LOOK_RECEIVE)
-            if release_fraction < 0.65:
-                continue
-            touched = self.interaction(person.track_id, index)
-            speed = self.net_ball_speed(index, min(len(self.frames) - 1, index + LOOK_RECEIVE))
-            if state == "IN_FLIGHT":
-                if not touched and acquire_fraction < 0.35:
-                    continue
-                if aligned < 0.15 and acquire_fraction < 0.45:
-                    continue
-                if speed > FLIGHT_SPEED and aligned < 0.40 and acquire_fraction < 0.40:
-                    continue
-            elif speed > FLIGHT_SPEED and not touched and acquire_fraction < 0.35:
-                continue
-            elif aligned < 0.0 and acquire_fraction < 0.40:
-                continue
-            if release_id is not None and release_id != person.track_id:
-                previous_acquire = self.close_fraction(release_id, index, LOOK_RECEIVE, acquire=True)
-                if previous_acquire >= 0.35 and previous_acquire + 0.15 >= acquire_fraction:
-                    continue
-            key = (acquire_fraction, run, -person.dist)
-            if best_key is None or key > best_key:
-                best_key = key
-                best_id = person.track_id
-        return best_id
 
     def _path_alignment(self, index: int) -> float | None:
         """Alignment of the path into this frame with the path leaving it."""
@@ -769,14 +496,12 @@ class _Clip:
             )
         return pd.DataFrame(rows, columns=POSSESSION_COLUMNS)
 
-
 def assign_clip(tracks: pd.DataFrame) -> pd.DataFrame:
     """Assign CONTROLLED, TOUCH, FREE_BALL, CONTESTED, or UNKNOWN for each ball frame."""
     return _Clip(tracks).assign()
 
-
 def possession_spells(frame: pd.DataFrame) -> int:
-    """Count contiguous CONTROLLED runs. A free or flight gap starts a new spell."""
+    """Count contiguous CONTROLLED runs. A gap with no owner starts a new spell."""
     spells = 0
     previous: str | None = None
     for state, owner in zip(frame["possession_state"], frame["possession_player_id"], strict=True):
@@ -785,7 +510,6 @@ def possession_spells(frame: pd.DataFrame) -> int:
             spells += 1
         previous = current
     return spells
-
 
 def possession_segments(frame: pd.DataFrame) -> pd.DataFrame:
     """Collapse consecutive frames that share a state and owner."""
@@ -816,9 +540,7 @@ def possession_segments(frame: pd.DataFrame) -> pd.DataFrame:
             count = 1
     return pd.DataFrame(rows, columns=SEGMENT_COLUMNS)
 
-
 POSSESSION_COLOR = (255, 0, 255)
-
 
 def _label_box(image, left: int, top: int, label: str, color: tuple[int, int, int], scale: float = 0.7) -> None:
     thickness = 2
@@ -836,7 +558,6 @@ def _label_box(image, left: int, top: int, label: str, color: tuple[int, int, in
         cv2.LINE_AA,
     )
 
-
 def _draw_owner(image, person: pd.Series, ball: pd.Series | None, label: str, color: tuple[int, int, int]) -> None:
     """Outline the owner and connect that box to the ball."""
     left, top = int(round(float(person["x1"]))), int(round(float(person["y1"])))
@@ -849,7 +570,6 @@ def _draw_owner(image, person: pd.Series, ball: pd.Series | None, label: str, co
     ball_center = (int(round(float(ball["center_x"]))), int(round(float(ball["center_y"]))))
     cv2.line(image, feet, ball_center, color, 2, cv2.LINE_AA)
 
-
 def _row_team(row) -> int | None:
     value = getattr(row, "team_id", "")
     if value is None or value == "":
@@ -860,7 +580,6 @@ def _row_team(row) -> int | None:
     except TypeError:
         return None
     return int(float(value))
-
 
 def _row_score(row, name: str) -> float | None:
     if not hasattr(row, name):
@@ -875,13 +594,11 @@ def _row_score(row, name: str) -> float | None:
         return None
     return float(value)
 
-
 def _team_suffix(row) -> str:
     team = _row_team(row)
     if team is None:
         return ""
     return " Team A" if team == 0 else " Team B"
-
 
 def render_possession(tracks_path: Path, possession_path: Path, video_path: Path, destination: Path) -> None:
     """Redraw the source clip with tracks, and mark the player who has the ball."""
@@ -983,7 +700,6 @@ def render_possession(tracks_path: Path, possession_path: Path, video_path: Path
         writer.release()
     print(f"  Video: {destination}")
 
-
 def _find_source(source: Path, stem: str) -> Path:
     if source.is_file():
         return source
@@ -992,7 +708,6 @@ def _find_source(source: Path, stem: str) -> Path:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(f"No source video for {stem} in {source}")
-
 
 def write_possession(tracks_path: Path, destination: Path) -> None:
     tracks = pd.read_csv(tracks_path)
@@ -1018,12 +733,10 @@ def write_possession(tracks_path: Path, destination: Path) -> None:
     print(f"  CSV: {destination}")
     print(f"  Segments: {segments_path}")
 
-
 def _render_one(tracks_path: Path, possession_path: Path, video_source: Path, output_dir: Path) -> None:
     stem = tracks_path.name.replace("_tracks.csv", "")
     video_path = _find_source(video_source, stem)
     render_possession(tracks_path, possession_path, video_path, output_dir / f"{stem}_possession_state.mp4")
-
 
 def main() -> int:
     args = parse_args()
@@ -1064,7 +777,6 @@ def main() -> int:
             print(f"Error on {path.name}: {exc}", file=sys.stderr)
             return 1
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

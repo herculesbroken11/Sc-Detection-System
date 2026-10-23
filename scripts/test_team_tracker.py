@@ -24,16 +24,11 @@ from team_byte import (
     jersey_feature,
 )
 from track_video import (
-    BALL_NMS_IOU,
-    PERSON_NMS_IOU_DEFAULT,
     PERSON_TRACK,
+    _assign_goalkeeper_teams,
+    _preserve_overlap_identity,
     _teams_conflict,
-    apply_class_confidence,
-    count_player_team_label_changes,
-    format_run_diagnostics,
-    parse_args,
-    person_and_ball_predict_kwargs,
-    player_tracking_floor,
+    suppress_player_on_official,
 )
 
 SOURCE = Path(r"E:\Football_dataset\gt_clips")
@@ -200,6 +195,88 @@ def test_jersey_split() -> None:
     print(f"jersey split: {labeled[0]['label']} {labeled[0]['confidence']:.2f} vs referee")
 
 
+def test_clip_criteria_ignore_a_small_third_kit() -> None:
+    """A few odd shirts in the clip do not become one of the two teams."""
+    generator = np.random.default_rng(0)
+    team_a = generator.normal([1.2, -2.0, 0.2, 0.1], 0.05, size=(80, 4))
+    team_b = generator.normal([1.3, 2.0, 0.1, 0.2], 0.05, size=(80, 4))
+    referee = generator.normal([0.1, 0.0, 0.0, 0.9], 0.02, size=(8, 4))
+    book = KitBook()
+    book.fit_clip([row for row in team_a] + [row for row in team_b] + [row for row in referee])
+    assert book.frozen
+    assert book.centers is not None
+    assert float(book.centers[:, 0].min()) > 0.6
+    assert abs(float(book.centers[0, 1]) - (-2.0)) < 0.4
+    assert abs(float(book.centers[1, 1]) - 2.0) < 0.4
+    light_team, light_confidence = book.classify(np.array([1.2, -2.0, 0.2, 0.1]))
+    dark_team, dark_confidence = book.classify(np.array([1.3, 2.0, 0.1, 0.2]))
+    odd_team, _odd_confidence = book.classify(np.array([0.1, 0.0, 0.0, 0.9]))
+    assert light_team is not None and dark_team is not None and light_team != dark_team
+    assert light_confidence >= 0.55 and dark_confidence >= 0.55
+    assert odd_team is None
+    frozen = book.centers.copy()
+    for frame in range(30):
+        book.observe(referee[0], frame)
+    assert np.allclose(book.centers, frozen)
+    print("clip criteria: two team colors kept, 8 odd shirts left out")
+
+
+def _person(track_id: int, frame: int, x: float, team: int | None, class_id: int = 0) -> dict:
+    row = {
+        "class_id": class_id,
+        "track_id": track_id,
+        "frame": frame,
+        "x1": x,
+        "y1": 200.0,
+        "x2": x + 40.0,
+        "y2": 290.0,
+        "center_x": x + 20.0,
+        "center_y": 245.0,
+        "team_id": "" if team is None else team,
+        "team_label": "",
+        "team_track_confidence": "",
+    }
+    return row
+
+
+def test_official_box_suppresses_player_duplicate() -> None:
+    """A goalkeeper or referee box removes the player box on the same body."""
+    boxes = make_boxes(
+        [
+            box_of(10, 20, 40, 90, conf=0.95, cls=0),
+            box_of(8, 18, 44, 96, conf=0.62, cls=1),
+            box_of(400, 20, 40, 90, conf=0.95, cls=0),
+            box_of(700, 20, 36, 80, conf=0.99, cls=0),
+            box_of(698, 16, 40, 88, conf=0.61, cls=2),
+        ]
+    )
+    kept = suppress_player_on_official(boxes)
+    data = np.asarray(kept.data)
+    classes = np.rint(data[:, 5]).astype(int)
+    assert list(classes).count(0) == 1
+    assert 1 in classes and 2 in classes
+    remaining_player = data[classes == 0][0]
+    assert float(remaining_player[0]) > 300
+    print("official box: goalkeeper and referee are not also players")
+
+
+def test_goalkeeper_follows_nearby_players() -> None:
+    """The goalkeeper takes the team with more players beside that goal, not a shirt color."""
+    rows = [_person(1, 0, 80.0, None, class_id=1)]
+    rows.append(_person(10, 0, 120.0, TEAM_A))
+    rows.append(_person(11, 0, 170.0, TEAM_A))
+    rows.append(_person(12, 0, 900.0, TEAM_B))
+    _assign_goalkeeper_teams(rows)
+    assert rows[0]["team_id"] == TEAM_A
+    other_end = [_person(2, frame, 800.0, None, class_id=1) for frame in range(3)]
+    for frame in range(3):
+        other_end.append(_person(20, frame, 760.0, TEAM_B))
+        other_end.append(_person(21, frame, 100.0, TEAM_A))
+    _assign_goalkeeper_teams(other_end)
+    assert all(row["team_id"] == TEAM_B for row in other_end if row["class_id"] == 1)
+    print("goalkeeper: team comes from the players beside that goal")
+
+
 def test_team_history() -> None:
     from ultralytics.trackers.byte_tracker import STrack
 
@@ -212,11 +289,29 @@ def test_team_history() -> None:
         track.take_reading(reading(TEAM_B, 0.9))
         track.commit_team()
     assert track.team_id == TEAM_A, "two wrong shirts must not flip the track"
-    for _ in range(6):
-        track.take_reading(reading(TEAM_B, 0.9))
-        track.commit_team()
-    assert track.team_id == TEAM_B, "a sustained clear shirt may correct the track"
-    print("team history: flicker held, six-frame correction applied")
+    track.take_reading(reading(TEAM_B, 0.9))
+    track.commit_team()
+    assert track.team_id == TEAM_B, "three clear shirts of the other team may correct the track"
+    print("team history: flicker held, three-frame correction applied")
+    fresh = TeamByteTracker(PERSON_TRACK).track_class(np.array([100, 200, 40, 90, 0], dtype=np.float32), 0.9, 0)
+    fresh.take_reading(reading(TEAM_A, 0.54))
+    fresh.commit_team()
+    assert fresh.team_id is None
+    fresh.take_reading(reading(TEAM_A, 0.55))
+    fresh.commit_team()
+    assert fresh.team_id == TEAM_A
+    for _ in range(3):
+        fresh.take_reading(reading(TEAM_B, 0.55))
+        fresh.commit_team()
+    assert fresh.team_id == TEAM_A
+    for _ in range(2):
+        fresh.take_reading(reading(TEAM_B, 0.72))
+        fresh.commit_team()
+    assert fresh.team_id == TEAM_A
+    fresh.take_reading(reading(TEAM_B, 0.72))
+    fresh.commit_team()
+    assert fresh.team_id == TEAM_B
+    print("first team: 0.55 sets it, three readings at 0.72 replace it")
 
 
 def test_lone_and_unknown() -> None:
@@ -228,7 +323,6 @@ def test_lone_and_unknown() -> None:
         teams.append([reading(TEAM_B if frame == 4 else TEAM_A, 0.2 if frame == 5 else 0.95)])
     teams[5] = [reading(None, 0.0)]
     tracker = TeamByteTracker(PERSON_TRACK)
-    BYTETracker.reset_id()
     tracked = feed(tracker, frames, teams)
     active = [frame for frame in tracked if frame]
     ids = {row[0] for frame in active for row in frame}
@@ -238,10 +332,8 @@ def test_lone_and_unknown() -> None:
 
 def test_competing_boxes() -> None:
     frames, truth, teams = crossing_frames()
-    BYTETracker.reset_id()
     plain = BYTETracker(PERSON_TRACK)
     plain_rows = feed(plain, frames, None)
-    BYTETracker.reset_id()
     aware = TeamByteTracker(PERSON_TRACK)
     aware_rows = feed(aware, frames, teams)
     plain_score = metrics(plain_rows, truth)
@@ -276,6 +368,90 @@ def test_cost_does_not_reject_a_lone_box() -> None:
     print("lone mismatch: IoU cost left unchanged")
 
 
+def _id_at(frame_rows, x: float) -> int:
+    return min(frame_rows, key=lambda row: abs(row[1][0] - x))[0]
+
+
+def test_overlap_keeps_original_track() -> None:
+    """One box left on two players continues the track whose team it already had."""
+    frames = []
+    teams = []
+    for frame in range(10):
+        frames.append([box_of(40 + frame * 16, 200), box_of(400 - frame * 16, 200)])
+        teams.append([reading(TEAM_A, 0.95), reading(TEAM_B, 0.95)])
+    # The boxes now meet. The next lone box sits on B, but the shirt is A's.
+    frames.append([box_of(200, 200), box_of(215, 200)])
+    teams.append([reading(TEAM_A, 0.95), reading(TEAM_B, 0.95)])
+    for _frame in range(4):
+        frames.append([box_of(215, 200)])
+        teams.append([reading(TEAM_A, 0.95)])
+    tracker = TeamByteTracker(PERSON_TRACK)
+    tracked = feed(tracker, frames, teams)
+    original_a = _id_at(tracked[9], 40 + 9 * 16)
+    original_b = _id_at(tracked[9], 400 - 9 * 16)
+    kept = {row[0] for row in tracked[-1]}
+    assert kept == {original_a}, (kept, original_a, original_b, [(index, rows) for index, rows in enumerate(tracked)])
+    teams_now = {int(track.track_id): track.team_id for track in tracker.tracked_stracks}
+    assert teams_now.get(original_a) == TEAM_A
+    print(f"overlap: remaining player kept id {original_a} and TEAM_A")
+
+
+def test_overlap_does_not_flip_team() -> None:
+    """A shirt read on the other player during an overlap does not change the team."""
+    frames = []
+    teams = []
+    for frame in range(10):
+        frames.append([box_of(40 + frame * 16, 200), box_of(400 - frame * 16, 210)])
+        teams.append([reading(TEAM_A, 0.95), reading(TEAM_B, 0.95)])
+    for _frame in range(8):
+        frames.append([box_of(200, 200), box_of(210, 210)])
+        teams.append([reading(TEAM_B, 0.95), reading(TEAM_A, 0.95)])
+    tracker = TeamByteTracker(PERSON_TRACK)
+    tracked = feed(tracker, frames, teams)
+    original_a = _id_at(tracked[9], 40 + 9 * 16)
+    original_b = _id_at(tracked[9], 400 - 9 * 16)
+    known = list(tracker.tracked_stracks) + list(tracker.lost_stracks)
+    teams_now = {int(track.track_id): track.team_id for track in known}
+    assert teams_now.get(original_a) == TEAM_A, teams_now
+    assert teams_now.get(original_b) == TEAM_B, teams_now
+    print(f"overlap: ids {original_a} and {original_b} kept TEAM_A and TEAM_B")
+
+
+def test_overlap_rows_keep_original_team() -> None:
+    def player(track_id: int, frame: int, x: float, team: int) -> dict:
+        return {
+            "class_id": 0,
+            "track_id": track_id,
+            "frame": frame,
+            "x1": x,
+            "y1": 200,
+            "x2": x + 40,
+            "y2": 290,
+            "team_id": team,
+            "team_label": "TEAM_A" if team == 0 else "TEAM_B",
+            "team_track_confidence": 0.9,
+        }
+
+    rows = []
+    for frame in range(4):
+        rows.append(player(1, frame, 80, TEAM_A))
+        rows.append(player(2, frame, 300, TEAM_B))
+    for frame in range(4, 7):
+        rows.append(player(1, frame, 180, TEAM_B))
+        rows.append(player(2, frame, 190, TEAM_A))
+    rows.append(player(9, 7, 185, TEAM_A))
+    fixes = _preserve_overlap_identity(rows)
+    assert fixes > 0
+    late = [row for row in rows if row["track_id"] == 1 and row["frame"] >= 4]
+    assert late and all(row["team_id"] == TEAM_A for row in late)
+    assert all(row["track_id"] != 9 for row in rows)
+    restored_b = [row for row in rows if row["track_id"] == 2 and row["frame"] >= 4]
+    assert restored_b and all(row["team_id"] == TEAM_B for row in restored_b)
+    carried = [row for row in rows if row["frame"] == 7]
+    assert carried and carried[0]["track_id"] == 1 and carried[0]["team_id"] == TEAM_A
+    print(f"overlap rows: restored {fixes} labels, fragment 9 rejoined as track 1")
+
+
 def test_refine_refuses_different_teams() -> None:
     def rows(team: int):
         return [
@@ -303,9 +479,7 @@ def probe_clip() -> None:
     model = YOLO(str(SOCCER_WEIGHTS))
     video = videos[0]
     capture = cv2.VideoCapture(str(video))
-    BYTETracker.reset_id()
     plain = BYTETracker(PERSON_TRACK)
-    BYTETracker.reset_id()
     aware = TeamByteTracker(PERSON_TRACK)
     book = KitBook()
     plain_ids: set[int] = set()
@@ -373,134 +547,19 @@ def player_labels(labels, boxes):
     return [labels[index] for index, class_id in enumerate(classes) if int(class_id) == 0]
 
 
-def test_player_tracking_floor() -> None:
-    low = float(PERSON_TRACK.track_low_thresh)
-    assert player_tracking_floor(None) == low
-    assert player_tracking_floor(low) == low
-    assert player_tracking_floor(0.05) == low
-    assert player_tracking_floor(0.75) == 0.75
-
-
-def test_player_confidence_filter() -> None:
-    """Players below the tracker low threshold are dropped. Other classes keep their own floors."""
-    floor = player_tracking_floor(0.05)
-    boxes = make_boxes(
-        [
-            box_of(10, 10, conf=0.09, cls=0),
-            box_of(80, 10, conf=0.10, cls=0),
-            box_of(150, 10, conf=0.50, cls=0),
-            box_of(220, 10, conf=0.09, cls=1),
-            box_of(290, 10, conf=0.09, cls=2),
-            box_of(360, 10, conf=0.50, cls=3),
-        ]
-    )
-    kept = apply_class_confidence(boxes, {0: floor, 3: 0.75})
-    classes = np.asarray(kept.cls).reshape(-1).astype(int)
-    confidences = np.asarray(kept.conf).reshape(-1)
-    players = [round(float(score), 2) for score in confidences[classes == 0]]
-    assert floor == 0.10
-    assert players == [0.10, 0.50]
-    assert int((classes == 1).sum()) == 1
-    assert int((classes == 2).sum()) == 1
-    assert int((classes == 3).sum()) == 0
-
-
-def test_nms_iou_kwargs() -> None:
-    shared = {"conf": 0.08, "imgsz": 1920}
-    person, ball = person_and_ball_predict_kwargs(shared, 0.7)
-    assert person["iou"] == 0.7
-    assert ball["iou"] == BALL_NMS_IOU == 0.4
-    assert "iou" not in shared
-    assert person["conf"] == 0.08 and ball["imgsz"] == 1920
-    person_default, ball_default = person_and_ball_predict_kwargs(shared, PERSON_NMS_IOU_DEFAULT)
-    assert person_default["iou"] == 0.4
-    assert ball_default["iou"] == 0.4
-
-    old_argv = sys.argv
-    try:
-        sys.argv = ["track_video.py", "--source", "clip.mp4"]
-        args = parse_args()
-    finally:
-        sys.argv = old_argv
-    assert args.nms_iou == PERSON_NMS_IOU_DEFAULT == 0.4
-    assert args.player_conf == float(PERSON_TRACK.track_low_thresh)
-    assert args.ball_conf == 0.75
-    assert args.conf == 0.08
-    assert PERSON_TRACK.track_high_thresh == 0.25
-    assert PERSON_TRACK.new_track_thresh == 0.45
-
-
-def test_diagnostics_distinguish_missing_values() -> None:
-    missing = "\n".join(
-        format_run_diagnostics(
-            {
-                "video": "clip.mp4",
-                "overlap_notes": None,
-                "raw_person": None,
-                "online_player_ids": None,
-            }
-        )
-    )
-    assert "raw_person_detections_before_player_filter: unavailable" in missing
-    assert "online_player_track_ids_before_refine: unavailable" in missing
-    assert "overlap_id_swaps: unavailable" in missing
-    assert "Pre-NMS candidate counts are unavailable." in missing
-
-    measured = "\n".join(
-        format_run_diagnostics(
-            {
-                "video": "clip.mp4",
-                "overlap_notes": [],
-                "raw_person": 3,
-                "online_player_ids": 2,
-                "refined_player_ids": 1,
-            }
-        )
-    )
-    assert "raw_person_detections_before_player_filter: 3" in measured
-    assert "online_player_track_ids_before_refine: 2" in measured
-    assert "player_track_ids_after_refine: 1" in measured
-    assert "overlap_id_swaps: 0" in measured
-    assert "overlap_id_swap_frames: none" in measured
-
-    noted = format_run_diagnostics(
-        {
-            "video": "clip.mp4",
-            "overlap_notes": [{"class_id": 0, "track_ids": (4, 9), "after_frame": 12}],
-        }
-    )
-    assert "overlap_id_swap: class 0 IDs 4 and 9 after frame 12" in noted
-
-    changes = count_player_team_label_changes(
-        [
-            {"class_id": 0, "track_id": 1, "frame": 1, "team_label": "TEAM_A"},
-            {"class_id": 0, "track_id": 1, "frame": 2, "team_label": "TEAM_A"},
-            {"class_id": 0, "track_id": 1, "frame": 3, "team_label": "TEAM_B"},
-            {"class_id": 0, "track_id": 2, "frame": 1, "team_label": ""},
-            {"class_id": 0, "track_id": 2, "frame": 2, "team_label": "UNKNOWN"},
-            {"class_id": 1, "track_id": 3, "frame": 1, "team_label": "TEAM_A"},
-            {"class_id": 1, "track_id": 3, "frame": 2, "team_label": "TEAM_B"},
-        ]
-    )
-    assert changes == (2, 1)
-    assert count_player_team_label_changes([{"class_id": 0, "track_id": 1, "frame": 1}]) is None
-
-
-def run_synthetic_tests() -> None:
+def main() -> int:
     test_jersey_split()
+    test_clip_criteria_ignore_a_small_third_kit()
+    test_official_box_suppresses_player_duplicate()
+    test_goalkeeper_follows_nearby_players()
     test_team_history()
     test_lone_and_unknown()
     test_cost_does_not_reject_a_lone_box()
     test_refine_refuses_different_teams()
+    test_overlap_keeps_original_track()
+    test_overlap_does_not_flip_team()
+    test_overlap_rows_keep_original_team()
     test_competing_boxes()
-    test_player_tracking_floor()
-    test_player_confidence_filter()
-    test_nms_iou_kwargs()
-    test_diagnostics_distinguish_missing_values()
-
-
-def main() -> int:
-    run_synthetic_tests()
     probe_clip()
     print("team tracker checks passed")
     return 0
